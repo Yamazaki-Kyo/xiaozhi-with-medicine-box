@@ -22,6 +22,11 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <esp_http_server.h>
+#include <esp_netif.h>
+
+#include "motor_controller.h"
+#include "servo_controller.h"
 
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
@@ -64,149 +69,6 @@ static const gc9a01_lcd_init_cmd_t gc9107_lcd_init_cmds[] = {
 #endif
 
 #define TAG "SmartRobotBoard"
-
-// ============================================================
-// DRV8833 电机驱动 — 单路 H 桥控制
-//
-//   DRV8833 真值表:
-//     IN1=0   IN2=0   → Coast (滑行停止)
-//     IN1=PWM IN2=0   → 正转
-//     IN1=0   IN2=PWM → 反转
-//     IN1=1   IN2=1   → Brake (刹车)
-//
-//   LEDC 10-bit PWM @ 5kHz 实现调速
-// ============================================================
-class MotorController {
-private:
-    gpio_num_t in1_pin_, in2_pin_;
-    ledc_channel_t ch_in1_, ch_in2_;
-    int current_duty_;      // 0~1023 (10-bit)
-    int current_dir_;       // 1=正转, -1=反转, 0=停止
-
-public:
-    // 默认构造（不分配硬件）
-    MotorController()
-        : in1_pin_(GPIO_NUM_NC), in2_pin_(GPIO_NUM_NC),
-          ch_in1_(LEDC_CHANNEL_MAX), ch_in2_(LEDC_CHANNEL_MAX),
-          current_duty_(0), current_dir_(0) {}
-
-    // 初始化硬件资源
-    void Init(gpio_num_t in1, gpio_num_t in2, ledc_channel_t ch1, ledc_channel_t ch2, ledc_timer_t timer) {
-        in1_pin_ = in1; in2_pin_ = in2;
-        ch_in1_ = ch1; ch_in2_ = ch2;
-
-        ledc_channel_config_t cfg1 = {};
-        cfg1.gpio_num = in1_pin_;
-        cfg1.speed_mode = LEDC_LOW_SPEED_MODE;
-        cfg1.channel = ch_in1_;
-        cfg1.timer_sel = timer;
-        cfg1.duty = 0;
-        cfg1.hpoint = 0;
-        ESP_ERROR_CHECK(ledc_channel_config(&cfg1));
-
-        ledc_channel_config_t cfg2 = {};
-        cfg2.gpio_num = in2_pin_;
-        cfg2.speed_mode = LEDC_LOW_SPEED_MODE;
-        cfg2.channel = ch_in2_;
-        cfg2.timer_sel = timer;
-        cfg2.duty = 0;
-        cfg2.hpoint = 0;
-        ESP_ERROR_CHECK(ledc_channel_config(&cfg2));
-    }
-
-    /// speed: 0~100（百分比）, dir: 1=正转, -1=反转
-    void Run(int speed, int dir) {
-        if (speed < 0) speed = 0;
-        if (speed > 100) speed = 100;
-        int duty = (speed * 1023) / 100;
-        current_duty_ = duty;
-        current_dir_ = dir;
-
-        ESP_LOGI(TAG, "Motor GPIO%d/%d dir=%d speed=%d duty=%d ch=%d/%d",
-                 in1_pin_, in2_pin_, dir, speed, duty, ch_in1_, ch_in2_);
-
-        if (dir == 1) {
-            // 正转: IN1=PWM, IN2=0
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, ch_in1_, duty));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, ch_in1_));
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, ch_in2_, 0));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, ch_in2_));
-        } else if (dir == -1) {
-            // 反转: IN1=0, IN2=PWM
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, ch_in1_, 0));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, ch_in1_));
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, ch_in2_, duty));
-            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, ch_in2_));
-        } else {
-            Stop();
-        }
-    }
-
-    void Stop() {
-        current_duty_ = 0;
-        current_dir_ = 0;
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, ch_in1_, 0));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, ch_in1_));
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, ch_in2_, 0));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, ch_in2_));
-    }
-
-    int GetSpeed() const { return (current_duty_ * 100) / 1023; }
-    int GetDir() const { return current_dir_; }
-};
-
-// ============================================================
-// 舵机控制 — LEDC PWM, 50Hz, 0.5~2.5ms → 0°~180°
-//   独立的 Timer + Channel，不与电机共享
-// ============================================================
-class ServoController {
-private:
-    gpio_num_t pin_;
-    ledc_channel_t channel_;
-    int current_angle_;
-
-    static constexpr int MIN_PULSE_US = 500;
-    static constexpr int MAX_PULSE_US = 2500;
-
-    int AngleToDuty(int angle) {
-        if (angle < 0) angle = 0;
-        if (angle > 180) angle = 180;
-        float pulse_us = MIN_PULSE_US + (float)(MAX_PULSE_US - MIN_PULSE_US) * angle / 180.0f;
-        // 16-bit timer @ 50Hz → period=65536, 每μs=65536/20000≈3.2768
-        // 14-bit → max_duty=16384, 每μs=16384/20000≈0.8192
-        return (int)(pulse_us * 16384.0f / 20000.0f);
-    }
-
-public:
-    ServoController() : pin_(GPIO_NUM_NC), channel_(LEDC_CHANNEL_MAX), current_angle_(90) {}
-
-    void Init(gpio_num_t pin, ledc_channel_t ch, ledc_timer_t timer) {
-        pin_ = pin;
-        channel_ = ch;
-        if (pin_ == GPIO_NUM_NC) return;
-
-        ledc_channel_config_t cfg = {};
-        cfg.gpio_num = pin_;
-        cfg.speed_mode = LEDC_LOW_SPEED_MODE;
-        cfg.channel = channel_;
-        cfg.timer_sel = timer;
-        cfg.duty = AngleToDuty(90);
-        cfg.hpoint = 0;
-        ESP_ERROR_CHECK(ledc_channel_config(&cfg));
-        current_angle_ = 90;
-    }
-
-    void SetAngle(int angle) {
-        if (pin_ == GPIO_NUM_NC) return;
-        int duty = AngleToDuty(angle);
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, channel_, duty));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, channel_));
-        current_angle_ = angle;
-        ESP_LOGI(TAG, "舵机 GPIO%d → %d°", pin_, angle);
-    }
-
-    int GetAngle() const { return current_angle_; }
-};
 
 class SmartRobotBoard : public WifiBoard {
 private:
@@ -284,6 +146,100 @@ private:
         ESP_LOGI(TAG, "串口控制已启动 (UART1 RX=IO39 TX=IO38)");
     }
 
+    // ---- 电机测试网页 ----
+    httpd_handle_t motor_http_server_;
+
+    static esp_err_t HttpMotorPage(httpd_req_t* req) {
+        const char* html = R"HTML(
+<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>电机测试</title><style>
+body{font-family:Arial;text-align:center;padding:20px;background:#1a1a2e;color:#eee}
+h2{color:#e94560}.motor{margin:20px 0;padding:15px;background:#16213e;border-radius:10px}
+.btn{display:inline-block;padding:15px 25px;margin:5px;border:none;border-radius:8px;font-size:16px;cursor:pointer}
+.fwd{background:#0f3460;color:white}.rev{background:#533483;color:white}.stop{background:#e94560;color:white}
+.both{background:#0f3460;color:white;padding:15px 30px;font-size:18px;margin:5px}
+.speed-row{display:flex;align-items:center;justify-content:center;gap:10px;margin:10px 0}
+.speed-row input{width:150px}.speed-row span{min-width:40px;font-size:18px}
+</style></head><body>
+<h2>电机测试控制台</h2>
+<div class="motor"><h3>Motor A (IO1/IO2) - 右轮</h3>
+<div class="speed-row"><input type="range" min="0" max="100" value="100" oninput="sa.innerText=this.value"><span id="sa">100</span>%</div>
+<button class="btn fwd" onclick="send('/motor/a/forward',getSpeed('sa'))">正转</button>
+<button class="btn rev" onclick="send('/motor/a/reverse',getSpeed('sa'))">反转</button>
+<button class="btn stop" onclick="send('/motor/a/stop')">停止</button>
+</div>
+<div class="motor"><h3>Motor B (IO10/IO11) - 左轮</h3>
+<div class="speed-row"><input type="range" min="0" max="100" value="100" oninput="sb.innerText=this.value"><span id="sb">100</span>%</div>
+<button class="btn fwd" onclick="send('/motor/b/forward',getSpeed('sb'))">正转</button>
+<button class="btn rev" onclick="send('/motor/b/reverse',getSpeed('sb'))">反转</button>
+<button class="btn stop" onclick="send('/motor/b/stop')">停止</button>
+</div>
+<div class="motor"><h3>双电机同时</h3>
+<button class="btn both" onclick="send('/motor/both/forward',getSpeed('sa'),getSpeed('sb'))">同向正转</button>
+<button class="btn both" onclick="send('/motor/both/reverse',getSpeed('sa'),getSpeed('sb'))">同向反转</button>
+<button class="btn both" onclick="send('/motor/both/opposite',getSpeed('sa'),getSpeed('sb'))">反向(A正B反)</button>
+<button class="btn both" style="background:#e94560" onclick="send('/motor/both/stop')">全部停止</button>
+</div>
+<script>
+function getSpeed(id){return document.getElementById(id).innerText}
+function send(url,sa,sb){var u=url;if(sa)u+='?a='+sa;if(sb)u+='&b='+sb;fetch(u,{method:"POST"}).then(r=>r.text()).then(t=>console.log(t))}
+</script></body></html>)HTML";
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    static int ParseSpeed(httpd_req_t* req, const char* key, int def) {
+        char buf[16];
+        if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+            char val[8];
+            if (httpd_query_key_value(buf, key, val, sizeof(val)) == ESP_OK) {
+                int s = atoi(val);
+                if (s >= 0 && s <= 100) return s;
+            }
+        }
+        return def;
+    }
+
+    static esp_err_t HttpMotorAction(httpd_req_t* req) {
+        auto* self = static_cast<SmartRobotBoard*>(req->user_ctx);
+        std::string uri(req->uri);
+        int a = ParseSpeed(req, "a", 100);
+        int b = ParseSpeed(req, "b", 100);
+        if (uri.find("/motor/a/forward") != std::string::npos)       { self->motor_a_->Run(a, 1); }
+        else if (uri.find("/motor/a/reverse") != std::string::npos)  { self->motor_a_->Run(a, -1); }
+        else if (uri.find("/motor/a/stop") != std::string::npos)     { self->motor_a_->Stop(); }
+        else if (uri.find("/motor/b/forward") != std::string::npos)  { self->motor_b_->Run(b, 1); }
+        else if (uri.find("/motor/b/reverse") != std::string::npos)  { self->motor_b_->Run(b, -1); }
+        else if (uri.find("/motor/b/stop") != std::string::npos)     { self->motor_b_->Stop(); }
+        else if (uri.find("/motor/both/forward") != std::string::npos) { self->motor_a_->Run(a, 1); self->motor_b_->Run(b, 1); }
+        else if (uri.find("/motor/both/reverse") != std::string::npos){ self->motor_a_->Run(a, -1); self->motor_b_->Run(b, -1); }
+        else if (uri.find("/motor/both/opposite") != std::string::npos){self->motor_a_->Run(a, 1); self->motor_b_->Run(b, -1); }
+        else if (uri.find("/motor/both/stop") != std::string::npos)  { self->motor_a_->Stop(); self->motor_b_->Stop(); }
+        httpd_resp_sendstr(req, "OK");
+        return ESP_OK;
+    }
+
+    void InitializeMotorHttpServer() {
+        httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+        cfg.server_port = 8080;
+        cfg.uri_match_fn = httpd_uri_match_wildcard;
+        if (httpd_start(&motor_http_server_, &cfg) != ESP_OK) {
+            ESP_LOGW(TAG, "电机HTTP Server启动失败");
+            return;
+        }
+        httpd_uri_t page = {.uri = "/", .method = HTTP_GET, .handler = HttpMotorPage, .user_ctx = this};
+        httpd_register_uri_handler(motor_http_server_, &page);
+        httpd_uri_t action = {.uri = "/motor/*", .method = HTTP_POST, .handler = HttpMotorAction, .user_ctx = this};
+        httpd_register_uri_handler(motor_http_server_, &action);
+        esp_netif_ip_info_t ip;
+        if (esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip) == ESP_OK) {
+            ESP_LOGI(TAG, "电机测试网页: http://" IPSTR ":8080", IP2STR(&ip.ip));
+        } else {
+            ESP_LOGI(TAG, "电机测试网页: http://<IP>:8080");
+        }
+    }
+
     // ---- 舵机初始化（独立 Timer2 + CH4~5） ----
     void InitializeServos() {
         ledc_timer_config_t timer_cfg = {};
@@ -304,7 +260,7 @@ private:
         ESP_LOGI(TAG, "舵机初始化完成 (%d路 / 50Hz)", servo_count_);
     }
 
-    // ---- 电机 PWM 初始化（Timer3 + CH0~3，避免与背光 Timer0 冲突） ----
+    // ---- 电机 LEDC PWM 初始化 ----
     void InitializeMotors() {
         ledc_timer_config_t timer_cfg = {};
         timer_cfg.speed_mode = LEDC_LOW_SPEED_MODE;
@@ -313,17 +269,15 @@ private:
         timer_cfg.freq_hz = 5000;
         ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
 
-        // Motor A: IO1(AIN1)=CH0, IO2(AIN2)=CH1 → TT马达1
         motor_a_ = std::make_unique<MotorController>();
         motor_a_->Init(MOTOR_A_IN1_PIN, MOTOR_A_IN2_PIN,
                        LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_TIMER_3);
 
-        // Motor B: IO10(BIN1)=CH2, IO11(BIN2)=CH3 → TT马达2
         motor_b_ = std::make_unique<MotorController>();
         motor_b_->Init(MOTOR_B_IN1_PIN, MOTOR_B_IN2_PIN,
                        LEDC_CHANNEL_2, LEDC_CHANNEL_3, LEDC_TIMER_3);
 
-        ESP_LOGI(TAG, "电机 PWM 初始化完成 (DRV8833 / 5kHz / Timer3 CH0-3)");
+        ESP_LOGI(TAG, "电机 LEDC 初始化完成 (Timer3/5kHz)");
     }
 
     void InitializeSpi() {
@@ -402,7 +356,7 @@ private:
         auto& mcp = McpServer::GetInstance();
 
         // ========== 电机：移动 ==========
-        // 硬件限制：两电机必须同向才能正常输出电压
+        // 两马达对装：直行=反向转动，转弯=同向转动
         mcp.AddTool(
             "self.motor.forward",
             "小车向前直线行驶。适用指令：前进、往前走、向前移动、直行、冲。"
@@ -410,8 +364,8 @@ private:
             PropertyList({Property("speed", kPropertyTypeInteger, 100, 0, 100)}),
             [this](const PropertyList& props) -> ReturnValue {
                 int speed = props["speed"].value<int>();
-                motor_a_->Run(speed, 1);
-                motor_b_->Run(speed, 1);
+                motor_a_->Run(speed, 1);   // A 正转
+                motor_b_->Run(speed, -1);  // B 反转
                 StartAutoStopTimer();
                 ESP_LOGI(TAG, "MCP forward speed=%d", speed);
                 return true;
@@ -424,8 +378,8 @@ private:
             PropertyList({Property("speed", kPropertyTypeInteger, 100, 0, 100)}),
             [this](const PropertyList& props) -> ReturnValue {
                 int speed = props["speed"].value<int>();
-                motor_a_->Run(speed, -1);
-                motor_b_->Run(speed, -1);
+                motor_a_->Run(speed, -1);  // A 反转
+                motor_b_->Run(speed, 1);   // B 正转
                 StartAutoStopTimer();
                 ESP_LOGI(TAG, "MCP backward speed=%d", speed);
                 return true;
@@ -433,13 +387,13 @@ private:
 
         mcp.AddTool(
             "self.motor.turn_left",
-            "小车原地左转。适用指令：左转、向左转、往左拐、转左边。"
+            "小车左转（右轮快/左轮慢，同向差速）。适用指令：左转、向左转、往左拐、转左边。"
             "speed: 速度百分比 0-100，默认 100",
             PropertyList({Property("speed", kPropertyTypeInteger, 100, 0, 100)}),
             [this](const PropertyList& props) -> ReturnValue {
                 int speed = props["speed"].value<int>();
-                motor_a_->Run(speed, 1);
-                motor_b_->Run(speed * 2 / 3, 1);
+                motor_a_->Run(speed, 1);             // 右轮 100%
+                motor_b_->Run(speed * 65 / 100, 1);  // 左轮 65%
                 StartAutoStopTimer();
                 ESP_LOGI(TAG, "MCP turn_left speed=%d", speed);
                 return true;
@@ -447,13 +401,13 @@ private:
 
         mcp.AddTool(
             "self.motor.turn_right",
-            "小车原地右转。适用指令：右转、向右转、往右拐、转右边。"
+            "小车右转（右轮慢/左轮快，同向差速）。适用指令：右转、向右转、往右拐、转右边。"
             "speed: 速度百分比 0-100，默认 100",
             PropertyList({Property("speed", kPropertyTypeInteger, 100, 0, 100)}),
             [this](const PropertyList& props) -> ReturnValue {
                 int speed = props["speed"].value<int>();
-                motor_a_->Run(speed * 2 / 3, 1);
-                motor_b_->Run(speed, 1);
+                motor_a_->Run(speed * 65 / 100, -1); // 右轮 65%
+                motor_b_->Run(speed, -1);             // 左轮 100%
                 StartAutoStopTimer();
                 ESP_LOGI(TAG, "MCP turn_right speed=%d", speed);
                 return true;
@@ -550,11 +504,17 @@ public:
         ESP_LOGI(TAG, "AI瓦力机器人初始化完成");
     }
 
+    void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        InitializeMotorHttpServer();
+    }
+
     ~SmartRobotBoard() {
         if (auto_stop_timer_) {
             esp_timer_stop(auto_stop_timer_);
             esp_timer_delete(auto_stop_timer_);
         }
+        if (motor_http_server_) httpd_stop(motor_http_server_);
     }
 
     virtual Led* GetLed() override {
